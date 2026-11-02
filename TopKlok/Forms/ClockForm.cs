@@ -1,8 +1,10 @@
-using System.Globalization;
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using System.Net.Http.Json;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Win32;
@@ -18,7 +20,7 @@ internal sealed class ClockForm : Form, IMessageFilter
     private static readonly Color ClockAccentLight = Color.FromArgb(227, 212, 209);
     private static readonly Color ClockAccentDark = Color.FromArgb(112, 105, 103);
     private const string WindowsStartupKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    private const string WindowsStartupValueName = "AdhdKlok";
+    private const string WindowsStartupValueName = "TopKlok";
     private static readonly Rectangle MessageArea = new(32, WindowSize - 50, WindowSize - 64, 42);
     private static readonly string[] AlarmFiles = ["Alarm-01.wav", "Alarm-02.wav", "Alarm-03.wav", "Alarm-04.wav"];
     private static readonly Color BackgroundColor = Color.FromArgb(10, 10, 35);
@@ -46,6 +48,9 @@ internal sealed class ClockForm : Form, IMessageFilter
     private readonly string _pinPath = Path.Combine(AppContext.BaseDirectory, "clock-pinned.txt");
     private readonly string _pauseDurationPath = Path.Combine(AppContext.BaseDirectory, "pause-duration.txt");
     private readonly string _screenOffDuringPausePath = Path.Combine(AppContext.BaseDirectory, "screen-off-during-pause.txt");
+    private readonly string _registrationEnabledPath = Path.Combine(AppContext.BaseDirectory, "registration-enabled.txt");
+    private readonly string _registrationPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "TopKlok-registratie.txt");
     private readonly string _clickSoundPath = Path.Combine(AppContext.BaseDirectory, "click-sound.txt");
     private System.Media.SoundPlayer? _timerSound;
     private ContextMenuStrip? _pendingMenu;
@@ -66,6 +71,11 @@ internal sealed class ClockForm : Form, IMessageFilter
     private bool _isPauseActive;
     private bool _awaitingPauseChoice;
     private bool _screenOffDuringPause = true;
+    private bool _registrationEnabled = true;
+    private DateTimeOffset? _registrationSessionStartedAt;
+    private DateTimeOffset? _registrationPauseStartedAt;
+    private TimeSpan _registrationPauseDuration;
+    private bool _registrationWrittenThisRun;
     private bool _clickSoundEnabled;
     private Point _clickStartPosition;
     private bool _leftButtonPressed;
@@ -94,7 +104,7 @@ internal sealed class ClockForm : Form, IMessageFilter
 
     public ClockForm()
     {
-        Text = AppLanguage.Text("ADHD Klok", "ADHD Clock");
+        Text = AppLanguage.Text("TopKlok", "Topklok");
         ClientSize = new Size(WindowSize, WindowSize);
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = true;
@@ -109,6 +119,8 @@ internal sealed class ClockForm : Form, IMessageFilter
         _startWithWindows = LoadStartWithWindows();
         _pauseDuration = LoadPauseDuration();
         _screenOffDuringPause = LoadScreenOffDuringPause();
+        _registrationEnabled = LoadRegistrationEnabled();
+        EnsureRegistrationFileExists();
         _clickSoundEnabled = LoadClickSoundEnabled();
         LoadWeatherLocation();
         TopMost = _clockPinned;
@@ -142,9 +154,12 @@ internal sealed class ClockForm : Form, IMessageFilter
             _pinnedSettingsIcon.Dispose();
             _lightPinnedSettingsIcon.Dispose();
             _menuAnimationTimer.Dispose();
+            if (_registrationWrittenThisRun)
+                OpenRegistrationFile();
         };
         FormClosing += (_, _) =>
         {
+            FinishRegistrationSession(DateTimeOffset.Now);
             SavePosition();
             RestoreMonitorIfNeeded();
         };
@@ -433,6 +448,7 @@ internal sealed class ClockForm : Form, IMessageFilter
         {
             _awaitingPauseChoice = false;
             _timerEndsAt = null;
+            FinishRegistrationSession(DateTimeOffset.Now);
             _timerElapsed = false;
             _timerBlinkVisible = true;
             _timerBlinkTransitions = 0;
@@ -480,6 +496,61 @@ internal sealed class ClockForm : Form, IMessageFilter
             Renderer = new ToolStripProfessionalRenderer(new ClockMenuColorTable(_darkTheme)),
             Padding = new Padding(2)
         };
+        var keepMenuOpenForAction = false;
+        var closeMenuRequested = false;
+        void RunMenuActionKeepingOpen(Action action)
+        {
+            keepMenuOpenForAction = true;
+            try
+            {
+                action();
+            }
+            finally
+            {
+                menu.BeginInvoke(new Action(() => keepMenuOpenForAction = false));
+            }
+        }
+
+        var menuHeader = new Panel
+        {
+            BackColor = GetMenuBackgroundColor(),
+            Size = new Size(240, 32),
+            Margin = Padding.Empty
+        };
+        var menuTitle = new Label
+        {
+            Text = AppLanguage.Text("Instellingen", "Settings"),
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            ForeColor = GetMenuTextColor(),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(8, 0, 0, 0)
+        };
+        var closeMenuButton = new Button
+        {
+            Text = "×",
+            Dock = DockStyle.Right,
+            Width = 32,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = GetMenuBackgroundColor(),
+            ForeColor = GetMenuTextColor(),
+            TabStop = false,
+            AccessibleName = AppLanguage.Text("Menu sluiten", "Close menu")
+        };
+        closeMenuButton.FlatAppearance.BorderSize = 0;
+        closeMenuButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(120, 24, 36);
+        closeMenuButton.Click += (_, _) => menu.Close(ToolStripDropDownCloseReason.CloseCalled);
+        menuHeader.Controls.Add(menuTitle);
+        menuHeader.Controls.Add(closeMenuButton);
+        var menuHeaderHost = new ToolStripControlHost(menuHeader)
+        {
+            AutoSize = false,
+            Size = menuHeader.Size,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        menu.Items.Add(menuHeaderHost);
+
         var darkThemeItem = new ToolStripMenuItem(AppLanguage.Text("Donker", "Dark"))
         {
             Checked = _darkTheme,
@@ -490,8 +561,10 @@ internal sealed class ClockForm : Form, IMessageFilter
             Checked = !_darkTheme,
             CheckOnClick = false
         };
-        darkThemeItem.Click += (_, _) => SetTheme(true, darkThemeItem, lightThemeItem);
-        lightThemeItem.Click += (_, _) => SetTheme(false, darkThemeItem, lightThemeItem);
+        darkThemeItem.Click += (_, _) =>
+            RunMenuActionKeepingOpen(() => SetTheme(true, darkThemeItem, lightThemeItem));
+        lightThemeItem.Click += (_, _) =>
+            RunMenuActionKeepingOpen(() => SetTheme(false, darkThemeItem, lightThemeItem));
         var appearanceMenu = new ToolStripMenuItem(AppLanguage.Text("Weergave", "Appearance"));
         appearanceMenu.DropDownItems.Add(darkThemeItem);
         appearanceMenu.DropDownItems.Add(lightThemeItem);
@@ -503,6 +576,18 @@ internal sealed class ClockForm : Form, IMessageFilter
         };
         clickSoundItem.Click += (_, _) => SetClickSoundEnabled(!_clickSoundEnabled, clickSoundItem);
         menu.Items.Add(clickSoundItem);
+        var registrationItem = new ToolStripMenuItem(
+            AppLanguage.Text("Registratie aan/uit", "Registration on/off"))
+        {
+            Checked = _registrationEnabled,
+            CheckOnClick = false,
+            ToolTipText = AppLanguage.Text(
+                "Registratie geldt voor timersessies die hierna worden gestart.",
+                "Registration applies to timer sessions started from now on.")
+        };
+        registrationItem.Click += (_, _) =>
+            SetRegistrationEnabled(!_registrationEnabled, registrationItem);
+        menu.Items.Add(registrationItem);
         menu.Items.Add(new ToolStripSeparator());
         var pinMenuItem = new ToolStripMenuItem(AppLanguage.Text("Klok vastzetten op bureaublad", "Pin clock to desktop"))
         {
@@ -521,9 +606,10 @@ internal sealed class ClockForm : Form, IMessageFilter
         menu.Items.Add(startupMenuItem);
         menu.Items.Add(new ToolStripSeparator());
 
-        var timerMenu = new ToolStripMenuItem(AppLanguage.Text("⏱ Timer & Pauze & Instellen", "⏱ Timer & Break & Settings"));
-        timerMenu.DropDownItems.Add(AppLanguage.Text("Timer instellen...", "Set timer..."), null, (_, _) => OpenTimerSettings());
-        timerMenu.DropDownItems.Add(AppLanguage.Text("Pauzetijd instellen...", "Set break duration..."), null, (_, _) => OpenPauseSettings());
+        var timerMenu = new ToolStripMenuItem(AppLanguage.Text("⏱ Timer en pauze", "⏱ Timer and break"));
+        timerMenu.DropDownItems.Add(
+            AppLanguage.Text("Werktijd en pauzetijd instellen...", "Set work and break durations..."),
+            null, (_, _) => RunMenuActionKeepingOpen(OpenTimerSettings));
         var screenOffDuringPauseItem = new ToolStripMenuItem(
             AppLanguage.Text("Scherm uitschakelen tijdens pauze", "Turn off screen during break"))
         {
@@ -542,15 +628,20 @@ internal sealed class ClockForm : Form, IMessageFilter
                 Checked = alarmFile == _selectedAlarmFile,
                 CheckOnClick = false
             };
-            alarmItem.Click += (_, _) => SelectAlarm(alarmFile);
+            alarmItem.Click += (_, _) => RunMenuActionKeepingOpen(() => SelectAlarm(alarmFile));
             alarmMenu.DropDownItems.Add(alarmItem);
         }
 
         menu.Items.Add(timerMenu);
         menu.Items.Add(alarmMenu);
-        menu.Items.Add(AppLanguage.Text("🌤 Weer instellen", "🌤 Weather settings"), null, (_, _) => OpenWeatherSettings());
+        menu.Items.Add(AppLanguage.Text("🌤 Weer instellen", "🌤 Weather settings"), null,
+            (_, _) => RunMenuActionKeepingOpen(OpenWeatherSettings));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(AppLanguage.Text("Afsluiten", "Exit"), null, (_, _) => Close());
+        menu.Items.Add(AppLanguage.Text("Afsluiten", "Exit"), null, (_, _) =>
+        {
+            closeMenuRequested = true;
+            Close();
+        });
         foreach (ToolStripItem item in menu.Items)
             SetMenuItemColors(item, GetMenuTextColor());
         menu.Closing += (_, args) =>
@@ -558,6 +649,13 @@ internal sealed class ClockForm : Form, IMessageFilter
             var iconScreenBounds = RectangleToScreen(GetSettingsIconBounds());
             if (args.CloseReason == ToolStripDropDownCloseReason.AppClicked &&
                 iconScreenBounds.Contains(System.Windows.Forms.Cursor.Position))
+            {
+                args.Cancel = true;
+            }
+            else if (!closeMenuRequested &&
+                     (args.CloseReason == ToolStripDropDownCloseReason.ItemClicked ||
+                      (keepMenuOpenForAction &&
+                       args.CloseReason != ToolStripDropDownCloseReason.CloseCalled)))
             {
                 args.Cancel = true;
             }
@@ -661,39 +759,7 @@ internal sealed class ClockForm : Form, IMessageFilter
             return location;
         }
 
-        var adjacentPositions = new[]
-        {
-            (clockBounds.Left, clockBounds.Top - menuSize.Height),
-            (clockBounds.Right - menuSize.Width, clockBounds.Top - menuSize.Height),
-            (clockBounds.Left, clockBounds.Bottom),
-            (clockBounds.Right - menuSize.Width, clockBounds.Bottom)
-        };
-        foreach (var (x, y) in adjacentPositions)
-        {
-            if (TryGetMenuLocation(x, y, workingArea, clockBounds, menuSize, out location))
-                return location;
-        }
-
-        foreach (var screen in Screen.AllScreens.OrderBy(screen =>
-                     Math.Pow(screen.WorkingArea.Left - iconBounds.Left, 2) +
-                     Math.Pow(screen.WorkingArea.Top - iconBounds.Top, 2)))
-        {
-            var area = screen.WorkingArea;
-            var desktopPositions = new[]
-            {
-                (area.Left, area.Top),
-                (area.Right - menuSize.Width, area.Top),
-                (area.Left, area.Bottom - menuSize.Height),
-                (area.Right - menuSize.Width, area.Bottom - menuSize.Height)
-            };
-            foreach (var (x, y) in desktopPositions)
-            {
-                if (TryGetMenuLocation(x, y, area, clockBounds, menuSize, out location))
-                    return location;
-            }
-        }
-
-        throw new InvalidOperationException("Er is geen plek op het bureaublad waar het menu buiten de klok past.");
+        return Screen.PrimaryScreen?.WorkingArea.Location ?? Point.Empty;
     }
 
     private static bool TryGetMenuLocation(
@@ -704,16 +770,11 @@ internal sealed class ClockForm : Form, IMessageFilter
         Size menuSize,
         out Point location)
     {
-        if (menuSize.Width > workingArea.Width || menuSize.Height > workingArea.Height)
-        {
-            location = Point.Empty;
-            return false;
-        }
-
-        x = Math.Clamp(x, workingArea.Left, workingArea.Right - menuSize.Width);
-        y = Math.Clamp(y, workingArea.Top, workingArea.Bottom - menuSize.Height);
         var menuBounds = new Rectangle(new Point(x, y), menuSize);
-        if (!workingArea.Contains(menuBounds) || menuBounds.IntersectsWith(clockBounds))
+        if (menuSize.Width > workingArea.Width ||
+            menuSize.Height > workingArea.Height ||
+            !workingArea.Contains(menuBounds) ||
+            menuBounds.IntersectsWith(clockBounds))
         {
             location = Point.Empty;
             return false;
@@ -749,6 +810,17 @@ internal sealed class ClockForm : Form, IMessageFilter
             menu.BackColor = GetMenuBackgroundColor();
             menu.ForeColor = GetMenuTextColor();
             menu.Renderer = CreateMenuRenderer();
+            if (menu.Items.OfType<ToolStripControlHost>().FirstOrDefault()?.Control is Panel header)
+            {
+                header.BackColor = GetMenuBackgroundColor();
+                foreach (Control control in header.Controls)
+                {
+                    control.ForeColor = GetMenuTextColor();
+                    if (control is Button button)
+                        button.BackColor = GetMenuBackgroundColor();
+                }
+            }
+
             foreach (ToolStripItem item in menu.Items)
                 SetMenuItemColors(item, GetMenuTextColor());
         }
@@ -861,14 +933,22 @@ internal sealed class ClockForm : Form, IMessageFilter
     private void OpenTimerSettings()
     {
         using var dialog = new TimerSettingsForm(
-            AppLanguage.Text("Timer instellen", "Set timer"),
+            AppLanguage.Text("Timer en pauze instellen", "Set timer and break"),
+            _pauseDuration,
             startButtonText: AppLanguage.Text("Start timer", "Start timer"));
         ApplyDialogTheme(dialog);
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
+            FinishRegistrationSession(DateTimeOffset.Now);
             RestoreMonitorIfNeeded();
+            var sessionStartedAt = DateTimeOffset.Now;
             _workDuration = dialog.Duration;
-            _timerEndsAt = DateTimeOffset.Now.Add(dialog.Duration);
+            _pauseDuration = dialog.PauseDuration;
+            SavePauseDuration();
+            _registrationSessionStartedAt = _registrationEnabled ? sessionStartedAt : null;
+            _registrationPauseStartedAt = null;
+            _registrationPauseDuration = TimeSpan.Zero;
+            _timerEndsAt = sessionStartedAt.Add(dialog.Duration);
             _pauseEndsAt = null;
             _isPauseActive = false;
             _awaitingPauseChoice = false;
@@ -888,6 +968,7 @@ internal sealed class ClockForm : Form, IMessageFilter
     private void ResetTimer()
     {
         var wasPauseActive = _isPauseActive;
+        FinishRegistrationSession(DateTimeOffset.Now);
         RestoreMonitorIfNeeded();
         _workDuration = TimeSpan.Zero;
         _timerEndsAt = null;
@@ -902,36 +983,47 @@ internal sealed class ClockForm : Form, IMessageFilter
             : AppLanguage.Text("Timer teruggezet naar 00:00:00.", "Timer reset to 00:00:00.");
     }
 
-    private void OpenPauseSettings()
-    {
-        using var dialog = new TimerSettingsForm(
-            AppLanguage.Text("Pauzetijd instellen", "Set break duration"),
-            _pauseDuration, AppLanguage.Text("Pauzetijd opslaan", "Save break duration"));
-        ApplyDialogTheme(dialog);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-        {
-            if (dialog.WasClosedWithCloseButton && _isPauseActive)
-            {
-                ResetTimer();
-                Invalidate();
-            }
-
-            return;
-        }
-
-        _pauseDuration = dialog.Duration;
-        SavePauseDuration();
-        _messageText = AppLanguage.IsEnglish
-            ? $"Break duration set to {_pauseDuration:hh\\:mm\\:ss}."
-            : $"Pauzetijd ingesteld op {_pauseDuration:hh\\:mm\\:ss}.";
-        Invalidate();
-    }
-
     private void SetScreenOffDuringPause(bool enabled, ToolStripMenuItem menuItem)
     {
         _screenOffDuringPause = enabled;
         menuItem.Checked = enabled;
         SaveScreenOffDuringPause();
+    }
+
+    private void SetRegistrationEnabled(bool enabled, ToolStripMenuItem menuItem)
+    {
+        var previousValue = _registrationEnabled;
+        _registrationEnabled = enabled;
+        try
+        {
+            File.WriteAllText(_registrationEnabledPath, enabled.ToString());
+            menuItem.Checked = enabled;
+        }
+        catch (IOException exception)
+        {
+            _registrationEnabled = previousValue;
+            ShowRegistrationSettingSaveError(exception);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            _registrationEnabled = previousValue;
+            ShowRegistrationSettingSaveError(exception);
+        }
+        catch (SecurityException exception)
+        {
+            _registrationEnabled = previousValue;
+            ShowRegistrationSettingSaveError(exception);
+        }
+    }
+
+    private void ShowRegistrationSettingSaveError(Exception exception)
+    {
+        MessageBox.Show(this,
+            AppLanguage.IsEnglish
+                ? $"The registration setting could not be saved:\n{exception.Message}"
+                : $"De registratie-instelling kon niet worden opgeslagen:\n{exception.Message}",
+            AppLanguage.Text("Instelling niet opgeslagen", "Setting not saved"),
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     private void SetClickSoundEnabled(bool enabled, ToolStripMenuItem menuItem)
@@ -986,7 +1078,23 @@ internal sealed class ClockForm : Form, IMessageFilter
     private void ApplyDialogTheme(Form dialog)
     {
         if (dialog is SettingsDialogForm settingsDialog)
+        {
             settingsDialog.ApplyTheme(_darkTheme);
+            dialog.StartPosition = FormStartPosition.Manual;
+            var clockBounds = Bounds;
+            var screenArea = Screen.FromRectangle(clockBounds).WorkingArea;
+            var preferredTop = clockBounds.Top + (clockBounds.Height - dialog.Height) / 2;
+
+            if (TryGetMenuLocation(clockBounds.Right, preferredTop, screenArea, clockBounds, dialog.Size, out var location) ||
+                TryGetMenuLocation(clockBounds.Left - dialog.Width, preferredTop, screenArea, clockBounds, dialog.Size, out location))
+            {
+                dialog.Location = location;
+            }
+            else
+            {
+                dialog.Location = Screen.PrimaryScreen?.WorkingArea.Location ?? Point.Empty;
+            }
+        }
     }
 
     private bool LoadTheme()
@@ -1113,6 +1221,88 @@ internal sealed class ClockForm : Form, IMessageFilter
         {
             return TimeSpan.FromMinutes(5);
         }
+    }
+
+    private bool LoadRegistrationEnabled()
+    {
+        if (!File.Exists(_registrationEnabledPath))
+            return true;
+
+        try
+        {
+            if (bool.TryParse(File.ReadAllText(_registrationEnabledPath).Trim(), out var enabled))
+                return enabled;
+
+            MessageBox.Show(this,
+                AppLanguage.Text(
+                    "De opgeslagen registratiekeuze is ongeldig; registratie staat aan.",
+                    "The saved registration choice is invalid; registration is enabled."),
+                AppLanguage.Text("Registratie-instelling niet geladen", "Registration setting not loaded"),
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return true;
+        }
+        catch (IOException exception)
+        {
+            ShowRegistrationSettingLoadError(exception);
+            return true;
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            ShowRegistrationSettingLoadError(exception);
+            return true;
+        }
+        catch (SecurityException exception)
+        {
+            ShowRegistrationSettingLoadError(exception);
+            return true;
+        }
+    }
+
+    private void ShowRegistrationSettingLoadError(Exception exception)
+    {
+        MessageBox.Show(this,
+            AppLanguage.IsEnglish
+                ? $"The registration setting could not be read:\n{exception.Message}"
+                : $"De registratie-instelling kon niet worden gelezen:\n{exception.Message}",
+            AppLanguage.Text("Registratie-instelling niet geladen", "Registration setting not loaded"),
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    private void EnsureRegistrationFileExists()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(_registrationPath)
+                ?? throw new InvalidOperationException("The registration file path has no parent directory.");
+            Directory.CreateDirectory(directory);
+            using var _ = new FileStream(_registrationPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+        }
+        catch (IOException exception)
+        {
+            ShowRegistrationFileCreateError(exception);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            ShowRegistrationFileCreateError(exception);
+        }
+        catch (SecurityException exception)
+        {
+            ShowRegistrationFileCreateError(exception);
+        }
+        catch (InvalidOperationException exception)
+        {
+            ShowRegistrationFileCreateError(exception);
+        }
+    }
+
+    private void ShowRegistrationFileCreateError(Exception exception)
+    {
+        MessageBox.Show(this,
+            AppLanguage.IsEnglish
+                ? $"The registration file could not be created:\n{exception.Message}"
+                : $"Het registratiebestand kon niet worden aangemaakt:\n{exception.Message}",
+            AppLanguage.Text("Registratiebestand niet aangemaakt", "Registration file not created"),
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     private bool LoadScreenOffDuringPause()
@@ -1372,6 +1562,12 @@ internal sealed class ClockForm : Form, IMessageFilter
         var now = DateTimeOffset.Now;
         if (_isPauseActive && _pauseEndsAt is { } pauseEnd && now >= pauseEnd)
         {
+            if (_registrationPauseStartedAt is { } pauseStartedAt)
+            {
+                _registrationPauseDuration += pauseEnd - pauseStartedAt;
+                _registrationPauseStartedAt = null;
+            }
+
             RestoreMonitorIfNeeded(force: true);
             _pauseEndsAt = null;
             _isPauseActive = false;
@@ -1396,11 +1592,111 @@ internal sealed class ClockForm : Form, IMessageFilter
         _timerEndsAt = null;
         _pauseEndsAt = now.Add(_pauseDuration);
         _isPauseActive = true;
+        if (_registrationSessionStartedAt is not null)
+            _registrationPauseStartedAt = now;
         _timerElapsed = false;
         _messageText = AppLanguage.Text("Werktijd voorbij. Pauze gestart.", "Work time is over. Break started.");
         PlayTimerSound();
         if (_screenOffDuringPause)
             TrySetMonitorPower(false);
+    }
+
+    private void FinishRegistrationSession(DateTimeOffset endedAt)
+    {
+        if (_registrationSessionStartedAt is not { } startedAt)
+            return;
+
+        var elapsed = endedAt > startedAt ? endedAt - startedAt : TimeSpan.Zero;
+        var pauseDuration = _registrationPauseDuration;
+        if (_registrationPauseStartedAt is { } pauseStartedAt && endedAt > pauseStartedAt)
+            pauseDuration += endedAt - pauseStartedAt;
+        if (pauseDuration > elapsed)
+            pauseDuration = elapsed;
+        var worked = elapsed - pauseDuration;
+
+        _registrationSessionStartedAt = null;
+        _registrationPauseStartedAt = null;
+        _registrationPauseDuration = TimeSpan.Zero;
+
+        var record = string.Format(
+            CultureInfo.InvariantCulture,
+            "Datum: {0}, Uuren Gewerkt: {1}, Pauze: {2}, Totaal gewerkt: {3}{4}",
+            startedAt.ToLocalTime().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            FormatRegistrationDuration(elapsed),
+            FormatRegistrationDuration(pauseDuration),
+            FormatRegistrationDuration(worked),
+            Environment.NewLine);
+
+        try
+        {
+            var directory = Path.GetDirectoryName(_registrationPath)
+                ?? throw new InvalidOperationException("The registration file path has no parent directory.");
+            Directory.CreateDirectory(directory);
+            File.AppendAllText(_registrationPath, record, Encoding.UTF8);
+            _registrationWrittenThisRun = true;
+        }
+        catch (IOException exception)
+        {
+            ShowRegistrationWriteError(exception);
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            ShowRegistrationWriteError(exception);
+        }
+        catch (SecurityException exception)
+        {
+            ShowRegistrationWriteError(exception);
+        }
+        catch (InvalidOperationException exception)
+        {
+            ShowRegistrationWriteError(exception);
+        }
+    }
+
+    private static string FormatRegistrationDuration(TimeSpan duration) =>
+        string.Format(CultureInfo.InvariantCulture, "{0:00}:{1:00}:{2:00}",
+            (int)duration.TotalHours, duration.Minutes, duration.Seconds);
+
+    private void ShowRegistrationWriteError(Exception exception)
+    {
+        MessageBox.Show(this,
+            AppLanguage.IsEnglish
+                ? $"The registration could not be written:\n{exception.Message}"
+                : $"De registratie kon niet worden opgeslagen:\n{exception.Message}",
+            AppLanguage.Text("Registratie niet opgeslagen", "Registration not saved"),
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    private void OpenRegistrationFile()
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo("notepad.exe") { UseShellExecute = true };
+            startInfo.ArgumentList.Add(_registrationPath);
+            Process.Start(startInfo);
+        }
+        catch (System.ComponentModel.Win32Exception exception)
+        {
+            ShowRegistrationOpenError(exception);
+        }
+        catch (InvalidOperationException exception)
+        {
+            ShowRegistrationOpenError(exception);
+        }
+        catch (SecurityException exception)
+        {
+            ShowRegistrationOpenError(exception);
+        }
+    }
+
+    private static void ShowRegistrationOpenError(Exception exception)
+    {
+        MessageBox.Show(
+            AppLanguage.IsEnglish
+                ? $"The registration file could not be opened in Notepad:\n{exception.Message}"
+                : $"Het registratiebestand kon niet in Kladblok worden geopend:\n{exception.Message}",
+            AppLanguage.Text("Registratiebestand niet geopend", "Registration file not opened"),
+            MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     private void TrySetMonitorPower(bool turnOn)

@@ -16,7 +16,7 @@ Gebruik die tijd bijvoorbeeld voor een kop koffie, iets te eten, een korte wande
 
 ## _Screenshot_
 
-![Donker Thema](/Media/Images/ScreenShots/Dark.png)     ![Licht Thema](Media/Images/ScreenShots/Light.png)
+![Top Klok desktop clock interface in dark theme, presented as a Windows desktop clock.](Media/Images/ScreenShots/Thema-Dark-Final.png)![Top Klok desktop clock interface in light theme, presented as a Windows desktop clock.](Media/Images/ScreenShots/Thema-Light-Final.png)
 
 ## Ontwikkelaars
 
@@ -65,7 +65,9 @@ Via Weergave kies je het donkere thema of Licht (Windows). De keuze wordt bewaar
 
 Via Klikgeluid aan/uit schakel je het Windows-menuklikgeluid in of uit voor muisklikken in de app. De keuze wordt bewaard.
 
-Onder Timer > Alarmgeluid kun je kiezen uit vier WAV-bestanden. De geselecteerde toon wordt gebruikt wanneer de timer afloopt.
+Via Registratie: Ja/Nee schakel je sessieregistratie in of uit. `TopKlok-registratie.txt` wordt bij de eerste start van de app aangemaakt in de map Documenten van de gebruiker, ook als registratie uitstaat. Wanneer registratie aanstaat, wordt bij het stoppen of afsluiten van een timersessie een regel met datum, verstreken tijd, pauze en netto gewerkte tijd aan het bestand toegevoegd. Na het afsluiten van TopKlok wordt dit bestand in Kladblok geopend als er tijdens die app-sessie registratie is toegevoegd. Registratie staat standaard aan.
+
+Via Timer en pauze instellen stel je de werktijd en pauzetijd samen in en start je de timer. De pauzetijd wordt bewaard voor de volgende keer. Onder Alarmgeluid kun je kiezen uit vier WAV-bestanden; de geselecteerde toon wordt gebruikt wanneer de timer afloopt.
 
 Sluit je het venster Timer instellen met het kruisje, dan wordt de actieve timer teruggezet naar 00:00:00.
 
